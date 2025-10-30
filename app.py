@@ -3,13 +3,9 @@ import httpx
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import random
-import time
 import threading
-import os
 
 app = Flask(__name__)
-last_sent_cache = {}
 lock = threading.Lock()
 
 # ------------------- تشفير -------------------
@@ -74,21 +70,12 @@ def send_like_request(token, TARGET):
     }
     try:
         resp = httpx.post(url, headers=headers, data=TARGET, verify=False, timeout=10)
-        if "invalid" in resp.text.lower():
-            return {"token": token[:20]+"...", "status_code": 401, "response_text": "invalid signature"}
-        return {
-            "token": token[:20]+"...",
-            "status_code": resp.status_code,
-            "headers": dict(resp.headers),
-            "response_text": resp.text
-        }
-    except Exception as e:
-        return {
-            "token": token[:20]+"...",
-            "status_code": "error",
-            "headers": {},
-            "response_text": str(e)
-        }
+        if resp.status_code == 200 and resp.text.strip() == "":
+            return True
+        else:
+            return False
+    except Exception:
+        return False
 
 # ------------------- API Flask -------------------
 @app.route("/send_like", methods=["GET"])
@@ -96,94 +83,56 @@ def send_like():
     player_id = request.args.get("player_id")
     if not player_id:
         return jsonify({"error": "player_id is required"}), 400
+
     try:
         player_id_int = int(player_id)
     except ValueError:
         return jsonify({"error": "player_id must be an integer"}), 400
 
-    now = time.time()
-    last_sent = last_sent_cache.get(player_id_int, 0)
-
-    # منع الإرسال إذا تم خلال 24 ساعة
-    if now - last_sent < 86400:
-        return jsonify({"error": "لقد اضفت لايكات قبل 24 ساعة ✅"}), 200
-
-    # جلب معلومات اللاعب قبل الإرسال
-    try:
-        info_url = f"https://info-yo1m.onrender.com/get?uid={player_id}&region=ME"
-        resp = httpx.get(info_url, timeout=10)
-        info_json = resp.json()
-        account_info = info_json.get("AccountInfo", {})
-        player_name = account_info.get("nickname", "Unknown")
-        player_uid = account_info.get("accountId", player_id_int)
-        likes_before = account_info.get("liked", 0)
-    except Exception:
-        return jsonify({"error": "فشل في جلب معلومات اللاعب"}), 500
-
-    encrypted_id = Encrypt_ID(player_uid)
+    # تحضير TARGET
+    encrypted_id = Encrypt_ID(player_id_int)
     encrypted_api_data = encrypt_api(f"08{encrypted_id}1007")
     TARGET = bytes.fromhex(encrypted_api_data)
 
-    likes_sent = 0
-    results = []
-    failed = []
-
     # جلب التوكنات
     try:
-        token_data = httpx.get("https://auto-token-n5t7.onrender.com/api/get_jwt", timeout=50).json()
+        token_data = httpx.get("https://auto-token-n5t7.onrender.com/api/get_jwt", timeout=60).json()
         tokens_dict = token_data.get("tokens", {})
-        token_items = list(tokens_dict.items())
-        random.shuffle(token_items)
-    except Exception:
-        return jsonify({"error": "فشل في جلب التوكنات"}), 500
+        token_list = list(tokens_dict.values())
+    except Exception as e:
+        return jsonify({"error": f"Failed to fetch tokens: {e}"}), 500
 
-    # تقسيم التوكنات إلى دفعات لتجنب استهلاك عالي للموارد
-    batch_size = 50  # عدد التوكنات في كل دفعة
-    for i in range(0, len(token_items), batch_size):
-        batch = token_items[i:i+batch_size]
-        with ThreadPoolExecutor(max_workers=batch_size) as executor:
-            futures = {executor.submit(send_like_request, token, TARGET): (uid, token) for uid, token in batch}
+    if not token_list:
+        return jsonify({"error": "No tokens returned from API"}), 500
+
+    total = len(token_list)
+    batch_size = 500
+    successes = 0
+    failures = 0
+
+    # تقسيم التوكنات إلى دفعات
+    for i in range(0, total, batch_size):
+        batch = token_list[i:i+batch_size]
+        with ThreadPoolExecutor(max_workers=500) as executor:
+            futures = [executor.submit(send_like_request, token, TARGET) for token in batch]
             for future in as_completed(futures):
-                if likes_sent >= 100:
-                    break
-                uid, token = futures[future]
-                res = future.result()
-                if res["status_code"] == 200 and res["response_text"].strip() == "":
+                try:
+                    if future.result():
+                        with lock:
+                            successes += 1
+                    else:
+                        with lock:
+                            failures += 1
+                except Exception:
                     with lock:
-                        likes_sent += 1
-                        results.append(res)
-                else:
-                    failed.append(res)
-        if likes_sent >= 100:
-            break
-
-    last_sent_cache[player_id_int] = now
-
-    # جلب عدد اللايكات بعد الإرسال
-    likes_after = likes_before
-    try:
-        resp = httpx.get(info_url, timeout=10)
-        info_json = resp.json()
-        account_info = info_json.get("AccountInfo", {})
-        likes_after = account_info.get("liked", likes_before)
-    except Exception:
-        likes_after = likes_before
-
-    likes_added = likes_after - likes_before
-    if likes_added == 0:
-        return jsonify({"error": "لقد اضفت لايكات قبل 24 ساعة ✅"}), 200
+                        failures += 1
 
     return jsonify({
-        "player_id": player_uid,
-        "player_name": player_name,
-        "likes_before": likes_before,
-        "likes_added": likes_added,
-        "likes_after": likes_after,
-        "seconds_until_next_allowed": 86400,
-        "success_tokens": results,
-        "failed_tokens": failed
+        "player_id": player_id_int,
+        "total_tokens": total,
+        "likes_successful": successes,
+        "likes_failed": failures
     })
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=5000)
