@@ -3,25 +3,25 @@ import requests
 
 app = Flask(__name__)
 
-TARGET_URL = "http://fi10.bot-hosting.net:20160/login"   # الرابط الأصلي
+TARGET_URL = "http://fi10.bot-hosting.net:20160"  # الموقع الأصلي
 
-@app.route("/login", methods=["GET", "POST"])
-def proxy_login():
-    try:
-        if request.method == "GET":
-            # إرسال طلب GET للرابط الأصلي
-            r = requests.get(TARGET_URL, timeout=10)
-            return Response(r.content, status=r.status_code, content_type=r.headers.get("content-type"))
+@app.route('/', defaults={'path': ''}, methods=["GET", "POST"])
+@app.route('/<path:path>', methods=["GET", "POST"])
+def proxy(path):
+    # بناء الرابط الأصلي
+    url = f"{TARGET_URL}/{path}"
+    
+    # اختيار الطريقة GET أو POST
+    if request.method == "POST":
+        resp = requests.post(url, data=request.form, headers=request.headers, allow_redirects=False)
+    else:
+        resp = requests.get(url, params=request.args, headers=request.headers, allow_redirects=False)
+    
+    # تعديل المحتوى إذا لزم الأمر (روابط داخلية)
+    content = resp.content
+    content_type = resp.headers.get('Content-Type', 'text/html')
+    
+    return Response(content, status=resp.status_code, content_type=content_type)
 
-        elif request.method == "POST":
-            # إرسال البيانات بنفس البوست الأصلي
-            r = requests.post(TARGET_URL, data=request.form, timeout=10)
-            return Response(r.content, status=r.status_code, content_type=r.headers.get("content-type"))
-
-    except Exception as e:
-        return {"error": str(e)}, 500
-
-
-# لكي يعمل على Vercel
-def handler(event, context):
-    return app(event, context)
+if __name__ == "__main__":
+    app.run(debug=True)
