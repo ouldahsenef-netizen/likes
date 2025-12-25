@@ -3,9 +3,12 @@ import httpx
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import random
+import time
 import threading
 
 app = Flask(__name__)
+last_sent_cache = {}
 lock = threading.Lock()
 
 # ------------------- تشفير -------------------
@@ -64,18 +67,27 @@ def send_like_request(token, TARGET):
         'Expect': '100-continue',
         'X-Unity-Version': '2018.4.11f1',
         'X-GA': 'v1 1',
-        'ReleaseVersion': 'OB50',
+        'ReleaseVersion': 'OB51',
         'Content-Type': 'application/x-www-form-urlencoded',
         'Authorization': f'Bearer {token}'
     }
     try:
         resp = httpx.post(url, headers=headers, data=TARGET, verify=False, timeout=10)
-        if resp.status_code == 200 and resp.text.strip() == "":
-            return True
-        else:
-            return False
-    except Exception:
-        return False
+        if "invalid" in resp.text.lower():
+            return {"token": token[:20]+"...", "status_code": 401, "response_text": "invalid signature"}
+        return {
+            "token": token[:20]+"...",
+            "status_code": resp.status_code,
+            "headers": dict(resp.headers),
+            "response_text": resp.text
+        }
+    except Exception as e:
+        return {
+            "token": token[:20]+"...",
+            "status_code": "error",
+            "headers": {},
+            "response_text": str(e)
+        }
 
 # ------------------- API Flask -------------------
 @app.route("/send_like", methods=["GET"])
@@ -83,55 +95,92 @@ def send_like():
     player_id = request.args.get("player_id")
     if not player_id:
         return jsonify({"error": "player_id is required"}), 400
-
     try:
         player_id_int = int(player_id)
     except ValueError:
         return jsonify({"error": "player_id must be an integer"}), 400
 
-    # تحضير TARGET
-    encrypted_id = Encrypt_ID(player_id_int)
+    now = time.time()
+    last_sent = last_sent_cache.get(player_id_int, 0)
+
+    # جلب معلومات اللاعب قبل الإرسال من API الجديد
+    try:
+        info_url = f"http://217.160.125.128:14214/accinfo?uid={player_id}&region=ME"
+        resp = httpx.get(info_url, timeout=10)
+        info_json = resp.json()
+        basic_info = info_json.get("basicInfo", {})
+        player_name = basic_info.get("nickname", "Unknown")
+        player_uid = basic_info.get("accountId", player_id)
+        likes_before = basic_info.get("liked", 0)  # هنا التغيير: استخدام "liked" بدلاً من "AccountLikes"
+    except Exception as e:
+        return jsonify({"error": f"Error fetching player info: {e}"}), 500
+
+    # منع الإرسال إذا تم خلال 24 ساعة
+    if now - last_sent < 86400:
+        return jsonify({"error": "لقد اضفت لايكات قبل 24 ساعة ✅"}), 200
+
+    encrypted_id = Encrypt_ID(player_uid)
     encrypted_api_data = encrypt_api(f"08{encrypted_id}1007")
     TARGET = bytes.fromhex(encrypted_api_data)
 
-    # جلب التوكنات
-    try:
-        token_data = httpx.get("https://auto-token-n5t7.onrender.com/api/get_jwt", timeout=60).json()
-        tokens_dict = token_data.get("tokens", {})
-        token_list = list(tokens_dict.values())
-    except Exception as e:
-        return jsonify({"error": f"Failed to fetch tokens: {e}"}), 500
+    likes_sent = 0
+    results = []
+    failed = []
 
-    if not token_list:
-        return jsonify({"error": "No tokens returned from API"}), 500
+    # حلقة مستمرة حتى نصل 100 لايك ناجح
+    while likes_sent < 100:
+        try:
+            token_data = httpx.get("https://auto60tok.onrender.com/api/get_jwt", timeout=50).json()
+            tokens_dict = token_data.get("tokens", {})
+            token_items = list(tokens_dict.items())
+            random.shuffle(token_items)
+            token_items = token_items[:500]  # 100 توكن جديدة في كل دورة
+        except Exception as e:
+            return jsonify({"error": f"Failed to fetch tokens: {e}"}), 500
 
-    total = len(token_list)
-    batch_size = 500
-    successes = 0
-    failures = 0
-
-    # تقسيم التوكنات إلى دفعات
-    for i in range(0, total, batch_size):
-        batch = token_list[i:i+batch_size]
         with ThreadPoolExecutor(max_workers=500) as executor:
-            futures = [executor.submit(send_like_request, token, TARGET) for token in batch]
+            futures = {executor.submit(send_like_request, token, TARGET): (uid, token)
+                       for uid, token in token_items}
             for future in as_completed(futures):
-                try:
-                    if future.result():
-                        with lock:
-                            successes += 1
-                    else:
-                        with lock:
-                            failures += 1
-                except Exception:
+                if likes_sent >= 100:
+                    break
+                uid, token = futures[future]
+                res = future.result()
+                if res["status_code"] == 200 and res["response_text"].strip() == "":
                     with lock:
-                        failures += 1
+                        likes_sent += 1
+                        results.append(res)
+                else:
+                    failed.append(res)
 
+    last_sent_cache[player_id_int] = now
+
+    # جلب معلومات اللاعب بعد الإرسال
+    likes_after = likes_before
+    try:
+        resp = httpx.get(info_url, timeout=10)
+        info_json = resp.json()
+        basic_info = info_json.get("basicInfo", {})
+        likes_after = basic_info.get("liked", likes_before)  # هنا التغيير أيضاً
+    except Exception:
+        likes_after = likes_before
+
+    likes_added = likes_after - likes_before  # الفرق الفعلي
+
+    # إذا لم يزد اللايكات، نعتبره وصول للحد اليومي
+    if likes_added == 0:
+        return jsonify({"error": "لقد اضفت لايكات قبل 24 ساعة ✅"}), 200
+
+    # إذا تم إضافة لايكات، نعرض النتائج العادية
     return jsonify({
-        "player_id": player_id_int,
-        "total_tokens": total,
-        "likes_successful": successes,
-        "likes_failed": failures
+        "player_id": player_uid,
+        "player_name": player_name,
+        "likes_before": likes_before,
+        "likes_added": likes_added,
+        "likes_after": likes_after,
+        "seconds_until_next_allowed": 86400,
+        "success_tokens": results,
+        "failed_tokens": failed
     })
 
 if __name__ == "__main__":
