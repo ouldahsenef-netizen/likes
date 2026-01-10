@@ -52,135 +52,92 @@ def Encrypt_ID(x):
 
 def encrypt_api(plain_text):
     plain_text = bytes.fromhex(plain_text)
-    key = bytes([89, 103, 38, 116, 99, 37, 68, 69, 117, 104, 54, 37, 90, 99, 94, 56])
-    iv = bytes([54, 111, 121, 90, 68, 114, 50, 50, 69, 51, 121, 99, 104, 106, 77, 37])
+    key = bytes([89,103,38,116,99,37,68,69,117,104,54,37,90,99,94,56])
+    iv = bytes([54,111,121,90,68,114,50,50,69,51,121,99,104,106,77,37])
     cipher = AES.new(key, AES.MODE_CBC, iv)
-    cipher_text = cipher.encrypt(pad(plain_text, AES.block_size))
-    return cipher_text.hex()
+    return cipher.encrypt(pad(plain_text, AES.block_size)).hex()
 
 # ------------------- إرسال لايك -------------------
 def send_like_request(token, TARGET):
     url = "https://clientbp.ggblueshark.com/LikeProfile"
     headers = {
-        'User-Agent': 'Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)',
-        'Connection': 'Keep-Alive',
-        'Expect': '100-continue',
-        'X-Unity-Version': '2018.4.11f1',
-        'X-GA': 'v1 1',
-        'ReleaseVersion': 'OB51',
+        'User-Agent': 'Dalvik/2.1.0 (Android 9)',
         'Content-Type': 'application/x-www-form-urlencoded',
         'Authorization': f'Bearer {token}'
     }
     try:
-        resp = httpx.post(url, headers=headers, data=TARGET, verify=False, timeout=10)
-        if "invalid" in resp.text.lower():
-            return {"token": token[:20]+"...", "status_code": 401, "response_text": "invalid signature"}
-        return {
-            "token": token[:20]+"...",
-            "status_code": resp.status_code,
-            "headers": dict(resp.headers),
-            "response_text": resp.text
-        }
-    except Exception as e:
-        return {
-            "token": token[:20]+"...",
-            "status_code": "error",
-            "headers": {},
-            "response_text": str(e)
-        }
+        r = httpx.post(url, headers=headers, data=TARGET, timeout=8, verify=False)
+        if r.status_code == 200 and r.text.strip() == "":
+            return True
+        return False
+    except:
+        return False
 
-# ------------------- API Flask -------------------
+# ------------------- API -------------------
 @app.route("/send_like", methods=["GET"])
 def send_like():
     player_id = request.args.get("player_id")
     if not player_id:
-        return jsonify({"error": "player_id is required"}), 400
-    try:
-        player_id_int = int(player_id)
-    except ValueError:
-        return jsonify({"error": "player_id must be an integer"}), 400
+        return jsonify({"error": "player_id required"}), 400
 
     now = time.time()
-    last_sent = last_sent_cache.get(player_id_int, 0)
+    player_id = int(player_id)
 
-    # جلب معلومات اللاعب قبل الإرسال من API الجديد
-    try:
-        info_url = f"https://info-eight-rho.vercel.app/accinfo?uid={player_id}&region=IND"
-        resp = httpx.get(info_url, timeout=10)
-        info_json = resp.json()
-        basic_info = info_json.get("basicInfo", {})
-        player_name = basic_info.get("nickname", "Unknown")
-        player_uid = basic_info.get("accountId", player_id)
-        likes_before = basic_info.get("liked", 0)  # هنا التغيير: استخدام "liked" بدلاً من "AccountLikes"
-    except Exception as e:
-        return jsonify({"error": f"Error fetching player info: {e}"}), 500
-
-    # منع الإرسال إذا تم خلال 24 ساعة
-    if now - last_sent < 86400:
+    if now - last_sent_cache.get(player_id, 0) < 86400:
         return jsonify({"error": "لقد اضفت لايكات قبل 24 ساعة ✅"}), 200
 
-    encrypted_id = Encrypt_ID(player_uid)
-    encrypted_api_data = encrypt_api(f"08{encrypted_id}1007")
-    TARGET = bytes.fromhex(encrypted_api_data)
+    # جلب معلومات اللاعب
+    info_url = f"https://info-eight-rho.vercel.app/accinfo?uid={player_id}&region=IND"
+    info = httpx.get(info_url).json()
+    basic = info.get("basicInfo", {})
+    name = basic.get("nickname", "Unknown")
+    likes_before = basic.get("liked", 0)
+
+    encrypted_id = Encrypt_ID(player_id)
+    TARGET = bytes.fromhex(encrypt_api(f"08{encrypted_id}1007"))
 
     likes_sent = 0
-    results = []
-    failed = []
+    max_workers = 4  # 👈 التعديل الأساسي هنا
 
-    # حلقة مستمرة حتى نصل 100 لايك ناجح
     while likes_sent < 35:
-        try:
-            token_data = httpx.get("https://auto60tok-1.onrender.com/api/get_jwt", timeout=50).json()
-            tokens_dict = token_data.get("tokens", {})
-            token_items = list(tokens_dict.items())
-            random.shuffle(token_items)
-            token_items = token_items[:500]  # 100 توكن جديدة في كل دورة
-        except Exception as e:
-            return jsonify({"error": f"Failed to fetch tokens: {e}"}), 500
+        tokens = httpx.get(
+            "https://auto60tok-1.onrender.com/api/get_jwt",
+            timeout=30
+        ).json().get("tokens", {})
 
-        with ThreadPoolExecutor(max_workers=500) as executor:
-            futures = {executor.submit(send_like_request, token, TARGET): (uid, token)
-                       for uid, token in token_items}
-            for future in as_completed(futures):
-                if likes_sent >= 100:
+        token_list = list(tokens.values())
+        random.shuffle(token_list)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = []
+
+            for token in token_list:
+                if likes_sent >= 35:
                     break
-                uid, token = futures[future]
-                res = future.result()
-                if res["status_code"] == 200 and res["response_text"].strip() == "":
-                    with lock:
-                        likes_sent += 1
-                        results.append(res)
-                else:
-                    failed.append(res)
 
-    last_sent_cache[player_id_int] = now
+                futures.append(executor.submit(send_like_request, token, TARGET))
 
-    # جلب معلومات اللاعب بعد الإرسال
-    likes_after = likes_before
-    try:
-        resp = httpx.get(info_url, timeout=10)
-        info_json = resp.json()
-        basic_info = info_json.get("basicInfo", {})
-        likes_after = basic_info.get("liked", likes_before)  # هنا التغيير أيضاً
-    except Exception:
-        likes_after = likes_before
+                # التحكم الذكي: لا نتركهم يتراكموا
+                if len(futures) >= max_workers:
+                    done = as_completed(futures)
+                    for f in done:
+                        futures.remove(f)
+                        if f.result():
+                            likes_sent += 1
+                        break
 
-    likes_added = likes_after - likes_before  # الفرق الفعلي
+    last_sent_cache[player_id] = now
 
-    # إذا لم يزد اللايكات، نعتبره وصول للحد اليومي
-    if likes_added == 0:
-        return jsonify({"error": "لقد اضفت لايكات قبل 24 ساعة ✅"}), 200
+    # معلومات بعد الإرسال
+    after = httpx.get(info_url).json()
+    likes_after = after.get("basicInfo", {}).get("liked", likes_before)
 
-    # إذا تم إضافة لايكات، نعرض النتائج العادية
     return jsonify({
-        "player_id": player_uid,
-        "player_name": player_name,
+        "player_id": player_id,
+        "player_name": name,
         "likes_before": likes_before,
-        "likes_added": likes_added,
         "likes_after": likes_after,
-        "seconds_until_next_allowed": 86400,
-        "success_tokens": results,
-        "failed_tokens": failed
+        "likes_added": likes_after - likes_before
     })
 
 if __name__ == "__main__":
