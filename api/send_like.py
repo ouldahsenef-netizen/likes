@@ -99,7 +99,7 @@ def send_like():
     likes_sent = 0
     max_workers = 4  # 👈 التعديل الأساسي هنا
 
-    while likes_sent < 35:
+    while likes_sent < 300:
         tokens = httpx.get(
             "https://auto60tok-1.onrender.com/api/get_jwt",
             timeout=30
