@@ -67,74 +67,57 @@ def send_like_request(token, TARGET):
     }
     try:
         r = httpx.post(url, headers=headers, data=TARGET, timeout=8, verify=False)
-        if r.status_code == 200 and r.text.strip() == "":
-            return True
-        return False
+        return r.status_code == 200 and r.text.strip() == ""
     except:
         return False
 
 # ------------------- API -------------------
 @app.route("/send_like", methods=["GET"])
 def send_like():
-    player_id = request.args.get("player_id")
-    if not player_id:
-        return jsonify({"error": "player_id required"}), 400
-
+    player_id = int(request.args.get("player_id"))
     now = time.time()
-    player_id = int(player_id)
 
     if now - last_sent_cache.get(player_id, 0) < 86400:
         return jsonify({"error": "لقد اضفت لايكات قبل 24 ساعة ✅"}), 200
 
-    # جلب معلومات اللاعب
     info_url = f"https://info-eight-rho.vercel.app/accinfo?uid={player_id}&region=IND"
     info = httpx.get(info_url).json()
     basic = info.get("basicInfo", {})
-    name = basic.get("nickname", "Unknown")
     likes_before = basic.get("liked", 0)
 
-    encrypted_id = Encrypt_ID(player_id)
-    TARGET = bytes.fromhex(encrypt_api(f"08{encrypted_id}1007"))
+    TARGET = bytes.fromhex(encrypt_api(f"08{Encrypt_ID(player_id)}1007"))
 
     likes_sent = 0
-    max_workers = 4  # 👈 التعديل الأساسي هنا
+    max_workers = 2  # شبه تسلسلي
 
-    while likes_sent < 300:
-        tokens = httpx.get(
-            "https://auto60tok-1.onrender.com/api/get_jwt",
-            timeout=30
-        ).json().get("tokens", {})
+    tokens = list(
+        httpx.get("https://auto60tok-1.onrender.com/api/get_jwt")
+        .json().get("tokens", {}).values()
+    )
+    random.shuffle(tokens)
 
-        token_list = list(tokens.values())
-        random.shuffle(token_list)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = []
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = []
+        for token in tokens:
+            if likes_sent >= 300:
+                break
 
-            for token in token_list:
-                if likes_sent >= 35:
-                    break
+            futures.append(executor.submit(send_like_request, token, TARGET))
+            time.sleep(0.5)  # ⏱️ نصف ثانية بين كل لايك
 
-                futures.append(executor.submit(send_like_request, token, TARGET))
-
-                # التحكم الذكي: لا نتركهم يتراكموا
-                if len(futures) >= max_workers:
-                    done = as_completed(futures)
-                    for f in done:
-                        futures.remove(f)
-                        if f.result():
-                            likes_sent += 1
-                        break
+            for f in list(futures):
+                if f.done():
+                    futures.remove(f)
+                    if f.result():
+                        likes_sent += 1
 
     last_sent_cache[player_id] = now
 
-    # معلومات بعد الإرسال
     after = httpx.get(info_url).json()
     likes_after = after.get("basicInfo", {}).get("liked", likes_before)
 
     return jsonify({
-        "player_id": player_id,
-        "player_name": name,
         "likes_before": likes_before,
         "likes_after": likes_after,
         "likes_added": likes_after - likes_before
